@@ -1,0 +1,4 @@
+# constraints.txt
+pip>=23.0.0
+setuptools>=68.0.0
+wheel>=0.40.0
