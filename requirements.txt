@@ -3,15 +3,7 @@ pandas==2.2.2
 openpyxl==3.1.2
 gdown==5.1.0
 XlsxWriter
-openai>=1.40.0
-duckdb>=1.1.0
-pyarrow>=16.0.0
-numpy>=1.24.0
 sentence-transformers==2.7.0
-
-# --- REQUIRED for sentence-transformers to work ---
-# CPU-friendly Torch wheels (covers Windows/Linux and Apple Silicon)
-torch>=2.2.0; platform_system != "Darwin" or platform_machine != "arm64"
-torch>=2.2.0; platform_system == "Darwin" and platform_machine == "arm64"
+numpy>=1.24.0
 
 
