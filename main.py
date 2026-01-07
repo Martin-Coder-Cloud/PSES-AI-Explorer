@@ -1,10 +1,11 @@
-# main.py — Home-first router; warm backend on Menu 1 with visible spinner
+# main.py — Home-first router; Menu 1 renders first, then loads backend with centered overlay spinner
 from __future__ import annotations
 
 import importlib
 import time
 import streamlit as st
-import streamlit.components.v1 as components  # for scroll-to-top on Home
+import streamlit.components.v1 as components
+
 
 # --- Quick exit for GitHub Action keepalive pings (avoids heavy loading) ---
 def _is_keepalive_ping() -> bool:
@@ -16,9 +17,11 @@ def _is_keepalive_ping() -> bool:
     except Exception:
         return False
 
+
 if _is_keepalive_ping():
     st.write("✅ App is awake.")
     st.stop()
+
 
 # ── Make set_page_config idempotent ──────────────────────────────────────────
 if not hasattr(st, "_setpcf_wrapped"):
@@ -35,6 +38,7 @@ if not hasattr(st, "_setpcf_wrapped"):
 
 st.set_page_config(page_title="PSES Explorer", layout="wide")
 
+
 # ── Load data loader (optional) ──────────────────────────────────────────────
 _loader_err = ""
 _dl = None
@@ -43,13 +47,14 @@ try:
 except Exception as e:
     _loader_err = f"{type(e).__name__}: {e}"
 
+
 def _fn(name, default=None):
     return getattr(_dl, name, default) if _dl else default
 
-prewarm_all              = _fn("prewarm_all")
+
+prewarm_all = _fn("prewarm_all")
 preload_pswide_dataframe = _fn("preload_pswide_dataframe")  # may or may not exist
-get_backend_info         = _fn("get_backend_info")
-get_last_query_diag      = _fn("get_last_query_diag")
+
 
 # ── Navigation helper ────────────────────────────────────────────────────────
 def goto(page: str):
@@ -58,6 +63,7 @@ def goto(page: str):
         st.rerun()
     except Exception:
         st.experimental_rerun()
+
 
 # ── Remove hero background for non-Home pages ────────────────────────────────
 def _clear_bg_css():
@@ -77,9 +83,82 @@ def _clear_bg_css():
         unsafe_allow_html=True,
     )
 
+
+# ── Full-screen centered overlay spinner (HTML/CSS) ──────────────────────────
+def _show_center_overlay(message: str = "Loading database into memory…"):
+    # Fixed overlay so it is always centered and never “cut” by Streamlit header.
+    components.html(
+        f"""
+        <style>
+          .pses-overlay {{
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.35);
+            z-index: 999999;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+          }}
+          .pses-overlay-card {{
+            background: rgba(255,255,255,0.92);
+            border-radius: 18px;
+            padding: 22px 26px;
+            box-shadow: 0 16px 50px rgba(0,0,0,0.35);
+            min-width: 340px;
+            max-width: 520px;
+            font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+            color: #111827;
+          }}
+          .pses-row {{
+            display: flex;
+            gap: 14px;
+            align-items: center;
+          }}
+          .pses-spinner {{
+            width: 22px;
+            height: 22px;
+            border: 3px solid rgba(17,24,39,0.25);
+            border-top-color: rgba(17,24,39,0.95);
+            border-radius: 50%;
+            animation: pses-spin 0.9s linear infinite;
+            flex: 0 0 auto;
+          }}
+          @keyframes pses-spin {{
+            to {{ transform: rotate(360deg); }}
+          }}
+          .pses-title {{
+            font-size: 16px;
+            font-weight: 700;
+            margin: 0;
+            line-height: 1.25;
+          }}
+          .pses-sub {{
+            font-size: 13px;
+            margin: 6px 0 0 0;
+            opacity: 0.9;
+            line-height: 1.35;
+          }}
+        </style>
+
+        <div class="pses-overlay">
+          <div class="pses-overlay-card">
+            <div class="pses-row">
+              <div class="pses-spinner"></div>
+              <div>
+                <p class="pses-title">{message}</p>
+                <p class="pses-sub">One-time initialization. Queries will be much faster after this step.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+        """,
+        height=0,
+        width=0,
+    )
+
+
 # ── Home ─────────────────────────────────────────────────────────────────────
 def render_home():
-    # Scroll to top exactly once after navigating back from Menu 1
     if st.session_state.pop("_scroll_top_home", False):
         components.html(
             """
@@ -163,48 +242,48 @@ def render_home():
         goto("menu1")
     st.markdown("</div>", unsafe_allow_html=True)
 
-# ── Backend warm-up for Menu 1 (with visible UI) ─────────────────────────────
-def _ensure_menu1_backend_ready():
-    # Run once per session
-    if st.session_state.get("_menu1_backend_ready", False):
-        return
 
-    if not _dl:
-        st.error(f"Data loader not ready: {_loader_err or 'utils.data_loader failed to import.'}")
-        st.stop()
-
-    # Always show something immediately so the user doesn't see a frozen grey overlay
-    st.markdown("### Loading database…")
-    st.caption("This one-time step prepares the data backend so queries run fast.")
-
-    with st.spinner("Preparing data backend (one-time)…"):
-        # Light warmup (download + metadata) if present
-        if callable(prewarm_all):
-            prewarm_all()
-
-        # Optional: if you have an in-memory preload hook, call it here
-        if callable(preload_pswide_dataframe):
-            preload_pswide_dataframe()
-
-    st.session_state["_menu1_backend_ready"] = True
-
-# ── Menu 1 only ──────────────────────────────────────────────────────────────
+# ── Menu 1 ───────────────────────────────────────────────────────────────────
 def render_menu1():
     _clear_bg_css()
 
-    # Ensure backend is ready *with visible feedback* before loading Menu 1 module
-    _ensure_menu1_backend_ready()
-
+    # 1) Render Menu 1 FIRST so the query page appears immediately
     try:
         from menu1.main import run_menu1
         run_menu1()
     except Exception as e:
         st.error(f"Menu 1 is unavailable: {type(e).__name__}: {e}")
+        st.stop()
+
+    # 2) After Menu 1 has rendered, do the heavy load with a centered overlay spinner
+    #    Then rerun so the overlay disappears and never remains on screen.
+    if not st.session_state.get("_menu1_backend_ready", False):
+        if not _dl:
+            st.error(f"Data loader not ready: {_loader_err or 'utils.data_loader failed to import.'}")
+            st.stop()
+
+        _show_center_overlay("Loading database into memory…")
+
+        # Run warmup hooks (only if present)
+        try:
+            if callable(prewarm_all):
+                prewarm_all()
+            if callable(preload_pswide_dataframe):
+                preload_pswide_dataframe()
+        finally:
+            st.session_state["_menu1_backend_ready"] = True
+
+        # Clear overlay by rerunning after backend is ready
+        try:
+            st.rerun()
+        except Exception:
+            st.experimental_rerun()
 
     st.markdown("---")
     if st.button("🔙 Return to Home Page", key="back_home_btn"):
         st.session_state["_scroll_top_home"] = True
         goto("home")
+
 
 # ── Entry ────────────────────────────────────────────────────────────────────
 def main():
@@ -219,6 +298,7 @@ def main():
         render_menu1()
     else:
         render_home()
+
 
 if __name__ == "__main__":
     main()
