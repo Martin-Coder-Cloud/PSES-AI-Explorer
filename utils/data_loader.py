@@ -1,10 +1,10 @@
-# utils/data_loader.py — SAFE loader for Streamlit Cloud (no heavy prewarm)
+# utils/data_loader.py — SAFE loader for Streamlit Cloud + OPTIONAL in-memory PS-wide preload
 from __future__ import annotations
 
 import os
 import time
 import shutil
-from typing import Iterable, Optional, Sequence
+from typing import Iterable, Optional, Sequence, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -23,6 +23,10 @@ LOCAL_GZ_PATH = os.environ.get("PSES_RESULTS_GZ", "/tmp/Results2024.csv.gz")
 PSES_ENABLE_PARQUET = os.environ.get("PSES_ENABLE_PARQUET", "0").strip().lower() in ("1", "true", "yes")
 PARQUET_ROOTDIR = os.environ.get("PSES_PARQUET_DIR", "/tmp/pses_parquet/PSES_Results2024_v2")
 PARQUET_FLAG = os.path.join(PARQUET_ROOTDIR, "_BUILD_OK_v2")
+
+# NEW: Optional in-memory PS-wide preload (ENABLED by default)
+PSES_ENABLE_INMEM = os.environ.get("PSES_ENABLE_INMEM", "1").strip().lower() in ("1", "true", "yes")
+INMEM_CHUNKSIZE = int(os.environ.get("PSES_INMEM_CHUNKSIZE", "1250000"))
 
 # Output schema (normalized)
 OUT_COLS = [
@@ -184,6 +188,102 @@ def _normalize_df_types(df: pd.DataFrame) -> pd.DataFrame:
     df["question_code"] = df["question_code"].astype("string").str.strip().str.upper().astype(DTYPES["question_code"])
     df["group_value"] = _canon_demcode_series(df["group_value"]).astype(DTYPES["group_value"])
     return df
+
+# =============================================================================
+# NEW: In-memory PS-wide preload (lazy; triggered by Menu 1 load)
+# =============================================================================
+def _make_multiindex_key(question_code: str, years: Iterable[int | str], group_value: Optional[str]) -> Tuple[str, Tuple[int, ...], str]:
+    q = str(question_code).strip().upper()
+    years_int = tuple(int(y) for y in years)
+    gv = _canon_demcode_value(group_value)
+    gv_key = "All" if gv is None else gv
+    return q, years_int, gv_key
+
+@st.cache_resource(show_spinner=False)
+def preload_pswide_index() -> dict:
+    """
+    Build a PS-wide (LEVEL1ID==0) in-memory table + MultiIndex for near-instant lookups.
+    Runs once per live app instance (cache_resource).
+    """
+    csv_path = ensure_results2024_local()
+    usecols = _with_agree_in_usecols(CSV_USECOLS, csv_path)
+    agree_col = _AGREE_SRC  # set by _with_agree_in_usecols
+
+    frames: list[pd.DataFrame] = []
+    # Stream the gz once; keep only PS-wide rows
+    for chunk in pd.read_csv(csv_path, compression="gzip", usecols=usecols, chunksize=INMEM_CHUNKSIZE, low_memory=True):
+        if "LEVEL1ID" in chunk.columns:
+            mask_lvl = pd.to_numeric(chunk["LEVEL1ID"], errors="coerce").fillna(0).astype(int).eq(0)
+            chunk = chunk.loc[mask_lvl, :]
+        # Normalize to OUT_COLS
+        out = pd.DataFrame({
+            "year": pd.to_numeric(chunk["SURVEYR"], errors="coerce"),
+            "question_code": chunk["QUESTION"].astype("string").str.strip().str.upper(),
+            "group_value": _canon_demcode_series(chunk["DEMCODE"]),
+            "n": pd.to_numeric(chunk["ANSCOUNT"], errors="coerce"),
+            "positive_pct": pd.to_numeric(chunk["POSITIVE"], errors="coerce"),
+            "neutral_pct": pd.to_numeric(chunk["NEUTRAL"], errors="coerce"),
+            "negative_pct": pd.to_numeric(chunk["NEGATIVE"], errors="coerce"),
+            "agree_pct": pd.to_numeric(chunk.get(agree_col) if agree_col else None, errors="coerce"),
+            "answer1": pd.to_numeric(chunk.get("answer1"), errors="coerce"),
+            "answer2": pd.to_numeric(chunk.get("answer2"), errors="coerce"),
+            "answer3": pd.to_numeric(chunk.get("answer3"), errors="coerce"),
+            "answer4": pd.to_numeric(chunk.get("answer4"), errors="coerce"),
+            "answer5": pd.to_numeric(chunk.get("answer5"), errors="coerce"),
+            "answer6": pd.to_numeric(chunk.get("answer6"), errors="coerce"),
+            "answer7": pd.to_numeric(chunk.get("answer7"), errors="coerce"),
+        })
+        frames.append(out)
+
+    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=OUT_COLS)
+    df = _normalize_df_types(df)
+
+    # MultiIndex for fast filtering by exact keys
+    # (question_code, year, group_value) should uniquely identify a small slice
+    df = df.set_index(["question_code", "year", "group_value"], drop=False).sort_index()
+
+    return {
+        "df": df,
+        "rows": int(df.shape[0]),
+        "agree_src": _AGREE_SRC,
+        "csv_path": csv_path,
+    }
+
+def ensure_inmem_loaded() -> dict:
+    """
+    Public helper for UI to trigger preload with a spinner.
+    Returns summary dict; safe to call repeatedly.
+    """
+    if not PSES_ENABLE_INMEM:
+        return {"enabled": False, "rows": 0}
+    blob = preload_pswide_index()
+    return {"enabled": True, "rows": int(blob.get("rows", 0)), "agree_src": blob.get("agree_src")}
+
+def _inmem_lookup(question_code: str, years: Iterable[int | str], group_value: Optional[str]) -> pd.DataFrame:
+    """
+    Fast lookup into cached MultiIndex df.
+    """
+    blob = preload_pswide_index()
+    df = blob["df"]
+    q = str(question_code).strip().upper()
+    years_int = [int(y) for y in years]
+    gv = _canon_demcode_value(group_value)
+    gv_key = "All" if gv is None else gv
+
+    # Build mask using index levels (fast); MultiIndex allows partial selection
+    # We still support multiple years in one call.
+    try:
+        # Select all rows for q + gv, then filter years
+        # Index order is (question_code, year, group_value)
+        # Use slice for q, all years, gv
+        idx = pd.IndexSlice
+        sub = df.loc[idx[q, :, gv_key], :]
+        if not isinstance(sub, pd.DataFrame):
+            sub = sub.to_frame().T
+        sub = sub[sub["year"].astype(int).isin(years_int)]
+        return _normalize_df_types(sub)
+    except Exception:
+        return pd.DataFrame(columns=OUT_COLS)
 
 # =============================================================================
 # Optional Parquet (lazy, NOT used in prewarm)
@@ -394,7 +494,31 @@ def load_results2024_filtered(
     t0 = time.perf_counter()
     parquet_error = None
 
-    # If Parquet is enabled, try it first (still lazy)
+    # NEW: In-memory fast path (if enabled and already built)
+    if PSES_ENABLE_INMEM:
+        try:
+            df = _inmem_lookup(question_code, years, group_value)
+            _LAST_ENGINE = "inmem"
+            elapsed_ms = int((time.perf_counter() - t0) * 1000)
+            gv_norm = _canon_demcode_value(group_value)
+            _set_diag(
+                engine=_LAST_ENGINE,
+                elapsed_ms=elapsed_ms,
+                rows=int(df.shape[0]),
+                question_code=str(question_code),
+                years=",".join(str(y) for y in years),
+                group_value=("All" if gv_norm is None else gv_norm),
+                parquet_dir=PARQUET_ROOTDIR,
+                csv_path=LOCAL_GZ_PATH,
+                parquet_error=None,
+                agree_src=_AGREE_SRC,
+            )
+            return df
+        except Exception:
+            # Fall through to Parquet / CSV
+            pass
+
+    # If Parquet is enabled, try it next (still lazy)
     if PSES_ENABLE_PARQUET and _pyarrow_available():
         try:
             df = _parquet_query(question_code, years, group_value)
@@ -506,6 +630,7 @@ def prewarm_all() -> dict:
     return {
         "engine": "csv",
         "parquet_enabled": PSES_ENABLE_PARQUET,
+        "inmem_enabled": PSES_ENABLE_INMEM,
         "metadata_counts": dict(_META_CACHE["counts"]),
         "csv_path": csv_path,
         "agree_src": _AGREE_SRC,
@@ -524,6 +649,7 @@ def get_backend_info() -> dict:
     return {
         "last_engine": _LAST_ENGINE,
         "parquet_enabled": bool(summary.get("parquet_enabled", PSES_ENABLE_PARQUET)),
+        "inmem_enabled": bool(summary.get("inmem_enabled", PSES_ENABLE_INMEM)),
         "metadata_counts": summary.get("metadata_counts", _META_CACHE.get("counts", {})),
         "csv_path": summary.get("csv_path", LOCAL_GZ_PATH),
         "agree_src": summary.get("agree_src", _AGREE_SRC),
