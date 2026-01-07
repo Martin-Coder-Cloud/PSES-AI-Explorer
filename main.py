@@ -1,5 +1,6 @@
-# main.py — Home-first router; preload on Menu 1 load (in-memory); Home-only background
+# main.py — Home-first router; warm backend on Menu 1 with visible spinner
 from __future__ import annotations
+
 import importlib
 import time
 import streamlit as st
@@ -22,11 +23,13 @@ if _is_keepalive_ping():
 # ── Make set_page_config idempotent ──────────────────────────────────────────
 if not hasattr(st, "_setpcf_wrapped"):
     _orig_spc = st.set_page_config
+
     def _safe_set_page_config(*args, **kwargs):
         if st.session_state.get("_page_config_done"):
             return
         st.session_state["_page_config_done"] = True
         return _orig_spc(*args, **kwargs)
+
     st.set_page_config = _safe_set_page_config
     st._setpcf_wrapped = True
 
@@ -44,12 +47,9 @@ def _fn(name, default=None):
     return getattr(_dl, name, default) if _dl else default
 
 prewarm_all              = _fn("prewarm_all")
+preload_pswide_dataframe = _fn("preload_pswide_dataframe")  # may or may not exist
 get_backend_info         = _fn("get_backend_info")
 get_last_query_diag      = _fn("get_last_query_diag")
-
-# NEW: in-memory preload hook (optional; only runs on Menu 1)
-ensure_inmem_loaded      = _fn("ensure_inmem_loaded")
-PSES_ENABLE_INMEM        = _fn("PSES_ENABLE_INMEM", False)
 
 # ── Navigation helper ────────────────────────────────────────────────────────
 def goto(page: str):
@@ -61,7 +61,8 @@ def goto(page: str):
 
 # ── Remove hero background for non-Home pages ────────────────────────────────
 def _clear_bg_css():
-    st.markdown("""
+    st.markdown(
+        """
         <style>
             .block-container {
                 background-image: none !important;
@@ -72,7 +73,9 @@ def _clear_bg_css():
                 padding-bottom: 2rem !important;
             }
         </style>
-    """, unsafe_allow_html=True)
+        """,
+        unsafe_allow_html=True,
+    )
 
 # ── Home ─────────────────────────────────────────────────────────────────────
 def render_home():
@@ -85,10 +88,12 @@ def render_home():
               catch(e) { window.scrollTo(0,0); }
             </script>
             """,
-            height=0, width=0
+            height=0,
+            width=0,
         )
 
-    st.markdown("""
+    st.markdown(
+        """
         <style>
             .block-container {
                 padding-top: 100px !important;
@@ -122,10 +127,15 @@ def render_home():
             }
             .main-section a { color: #fff !important; text-decoration: underline; }
         </style>
-    """, unsafe_allow_html=True)
+        """,
+        unsafe_allow_html=True,
+    )
 
     st.markdown("<div class='main-section'>", unsafe_allow_html=True)
-    st.markdown("<div class='main-title'>Welcome to the AI-powered Explorer of the Public Service Employee Survey (PSES)</div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div class='main-title'>Welcome to the AI-powered Explorer of the Public Service Employee Survey (PSES)</div>",
+        unsafe_allow_html=True,
+    )
 
     st.markdown(
         """
@@ -144,7 +154,7 @@ def render_home():
         <p><em>Together, these features make the PSES AI Explorer a powerful, user-friendly platform for transforming survey data into actionable insights.</em></p>
         </div>
         """,
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
 
     st.markdown("<div class='single-button'>", unsafe_allow_html=True)
@@ -153,23 +163,44 @@ def render_home():
         goto("menu1")
     st.markdown("</div>", unsafe_allow_html=True)
 
+# ── Backend warm-up for Menu 1 (with visible UI) ─────────────────────────────
+def _ensure_menu1_backend_ready():
+    # Run once per session
+    if st.session_state.get("_menu1_backend_ready", False):
+        return
+
+    if not _dl:
+        st.error(f"Data loader not ready: {_loader_err or 'utils.data_loader failed to import.'}")
+        st.stop()
+
+    # Always show something immediately so the user doesn't see a frozen grey overlay
+    st.markdown("### Loading database…")
+    st.caption("This one-time step prepares the data backend so queries run fast.")
+
+    with st.spinner("Preparing data backend (one-time)…"):
+        # Light warmup (download + metadata) if present
+        if callable(prewarm_all):
+            prewarm_all()
+
+        # Optional: if you have an in-memory preload hook, call it here
+        if callable(preload_pswide_dataframe):
+            preload_pswide_dataframe()
+
+    st.session_state["_menu1_backend_ready"] = True
+
 # ── Menu 1 only ──────────────────────────────────────────────────────────────
 def render_menu1():
     _clear_bg_css()
 
-    # NEW: Trigger one-time in-memory preload when Menu 1 loads (not at app startup)
-    # This avoids health-check crashes while making queries near-instant after load.
-    if ensure_inmem_loaded and PSES_ENABLE_INMEM:
-        if not st.session_state.get("_inmem_ready", False):
-            with st.spinner("Loading database into memory (one-time)…"):
-                ensure_inmem_loaded()
-            st.session_state["_inmem_ready"] = True
+    # Ensure backend is ready *with visible feedback* before loading Menu 1 module
+    _ensure_menu1_backend_ready()
 
     try:
         from menu1.main import run_menu1
         run_menu1()
     except Exception as e:
         st.error(f"Menu 1 is unavailable: {type(e).__name__}: {e}")
+
     st.markdown("---")
     if st.button("🔙 Return to Home Page", key="back_home_btn"):
         st.session_state["_scroll_top_home"] = True
@@ -179,15 +210,6 @@ def render_menu1():
 def main():
     if "run_menu" in st.session_state:
         st.session_state.pop("run_menu")
-
-    # Keep your existing light prewarm (download + metadata only)
-    if prewarm_all:
-        if not st.session_state.get("_prewarmed", False):
-            with st.spinner("Preparing data backend (one-time)…"):
-                prewarm_all()
-            st.session_state["_prewarmed"] = True
-        else:
-            prewarm_all()
 
     if "_nav" not in st.session_state:
         st.session_state["_nav"] = "home"
