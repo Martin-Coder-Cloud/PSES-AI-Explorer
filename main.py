@@ -1,9 +1,11 @@
-# main.py — Home-first router; preload on app load; Home-only background
+# main.py — Home-first router; LAZY preload (only when Menu 1 is opened)
 from __future__ import annotations
+
 import importlib
 import time
 import streamlit as st
-import streamlit.components.v1 as components  # ← NEW: for scroll-to-top on Home
+import streamlit.components.v1 as components  # for scroll-to-top on Home
+
 
 # --- Quick exit for GitHub Action keepalive pings (avoids heavy loading) ---
 def _is_keepalive_ping() -> bool:
@@ -15,6 +17,7 @@ def _is_keepalive_ping() -> bool:
     except Exception:
         return False
 
+
 if _is_keepalive_ping():
     st.write("✅ App is awake.")
     st.stop()
@@ -23,15 +26,18 @@ if _is_keepalive_ping():
 # ── Make set_page_config idempotent ──────────────────────────────────────────
 if not hasattr(st, "_setpcf_wrapped"):
     _orig_spc = st.set_page_config
+
     def _safe_set_page_config(*args, **kwargs):
         if st.session_state.get("_page_config_done"):
             return
         st.session_state["_page_config_done"] = True
         return _orig_spc(*args, **kwargs)
+
     st.set_page_config = _safe_set_page_config
     st._setpcf_wrapped = True
 
 st.set_page_config(page_title="PSES Explorer", layout="wide")
+
 
 # ── Load data loader (optional) ──────────────────────────────────────────────
 _loader_err = ""
@@ -41,13 +47,16 @@ try:
 except Exception as e:
     _loader_err = f"{type(e).__name__}: {e}"
 
+
 def _fn(name, default=None):
     return getattr(_dl, name, default) if _dl else default
 
-prewarm_all              = _fn("prewarm_all")
-get_backend_info         = _fn("get_backend_info")
+
+prewarm_all = _fn("prewarm_all")
+get_backend_info = _fn("get_backend_info")
 preload_pswide_dataframe = _fn("preload_pswide_dataframe")
-get_last_query_diag      = _fn("get_last_query_diag")
+get_last_query_diag = _fn("get_last_query_diag")
+
 
 # ── Navigation helper ────────────────────────────────────────────────────────
 def goto(page: str):
@@ -57,9 +66,11 @@ def goto(page: str):
     except Exception:
         st.experimental_rerun()
 
+
 # ── Remove hero background for non-Home pages ────────────────────────────────
 def _clear_bg_css():
-    st.markdown("""
+    st.markdown(
+        """
         <style>
             .block-container {
                 background-image: none !important;
@@ -70,7 +81,30 @@ def _clear_bg_css():
                 padding-bottom: 2rem !important;
             }
         </style>
-    """, unsafe_allow_html=True)
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ── One-time warmup (LAZY) ───────────────────────────────────────────────────
+def _ensure_prewarmed_for_menu1():
+    """
+    Prewarm only when entering Menu 1. This avoids OOM crashes on Streamlit Cloud
+    during initial Home page load.
+    """
+    if not prewarm_all:
+        if _loader_err:
+            st.warning(f"Data loader not ready: {_loader_err}")
+        return
+
+    if st.session_state.get("_prewarmed", False):
+        return
+
+    with st.spinner("Preparing data backend (one-time)…"):
+        prewarm_all()
+
+    st.session_state["_prewarmed"] = True
+
 
 # ── Home ─────────────────────────────────────────────────────────────────────
 def render_home():
@@ -83,10 +117,12 @@ def render_home():
               catch(e) { window.scrollTo(0,0); }
             </script>
             """,
-            height=0, width=0
+            height=0,
+            width=0,
         )
 
-    st.markdown("""
+    st.markdown(
+        """
         <style>
             .block-container {
                 padding-top: 100px !important;
@@ -100,13 +136,10 @@ def render_home():
             }
             .main-section { margin-left: 200px; max-width: 820px; text-align: left; }
             .main-title { font-size: 42px; font-weight: 800; margin-bottom: 16px; }
-            /* subtitle style retained but not used */
             .subtitle { font-size: 22px; line-height: 1.4; margin-bottom: 18px; opacity: 0.95; max-width: 700px; }
-            /* Body text larger for readability */
             .context { font-size: 20px; line-height: 1.6; margin-top: 8px; margin-bottom: 36px; opacity: 0.95; max-width: 700px; text-align: left; }
             .single-button { display: flex; flex-direction: column; gap: 16px; }
 
-            /* Prominent START button */
             div.stButton > button {
                 background: linear-gradient(90deg, rgba(255,255,255,0.22), rgba(255,255,255,0.10)) !important;
                 color: #ffffff !important;
@@ -124,11 +157,15 @@ def render_home():
             }
             .main-section a { color: #fff !important; text-decoration: underline; }
         </style>
-    """, unsafe_allow_html=True)
+        """,
+        unsafe_allow_html=True,
+    )
 
     st.markdown("<div class='main-section'>", unsafe_allow_html=True)
-    st.markdown("<div class='main-title'>Welcome to the AI-powered Explorer of the Public Service Employee Survey (PSES)</div>", unsafe_allow_html=True)
-    # (Subtitle removed as requested)
+    st.markdown(
+        "<div class='main-title'>Welcome to the AI-powered Explorer of the Public Service Employee Survey (PSES)</div>",
+        unsafe_allow_html=True,
+    )
 
     st.markdown(
         """
@@ -147,7 +184,7 @@ def render_home():
         <p><em>Together, these features make the PSES AI Explorer a powerful, user-friendly platform for transforming survey data into actionable insights.</em></p>
         </div>
         """,
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
 
     st.markdown("<div class='single-button'>", unsafe_allow_html=True)
@@ -156,32 +193,30 @@ def render_home():
         goto("menu1")
     st.markdown("</div>", unsafe_allow_html=True)
 
+
 # ── Menu 1 only ──────────────────────────────────────────────────────────────
 def render_menu1():
     _clear_bg_css()
+
+    # LAZY prewarm: only when user enters Menu 1
+    _ensure_prewarmed_for_menu1()
+
     try:
         from menu1.main import run_menu1
         run_menu1()
     except Exception as e:
         st.error(f"Menu 1 is unavailable: {type(e).__name__}: {e}")
+
     st.markdown("---")
-    # Renamed button + set one-time scroll-to-top flag
     if st.button("🔙 Return to Home Page", key="back_home_btn"):
-        st.session_state["_scroll_top_home"] = True   # ← ensures we scroll to top when Home renders
+        st.session_state["_scroll_top_home"] = True
         goto("home")
+
 
 # ── Entry ────────────────────────────────────────────────────────────────────
 def main():
     if "run_menu" in st.session_state:
         st.session_state.pop("run_menu")
-
-    if prewarm_all:
-        if not st.session_state.get("_prewarmed", False):
-            with st.spinner("Preparing data backend (one-time)…"):
-                prewarm_all()
-            st.session_state["_prewarmed"] = True
-        else:
-            prewarm_all()
 
     if "_nav" not in st.session_state:
         st.session_state["_nav"] = "home"
@@ -191,6 +226,7 @@ def main():
         render_menu1()
     else:
         render_home()
+
 
 if __name__ == "__main__":
     main()
