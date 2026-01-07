@@ -18,8 +18,9 @@ import streamlit as st
 GDRIVE_FILE_ID_FALLBACK = "1VdMQQfEP-BNXle8GeD-Z_upt2pPIGvc8"
 LOCAL_GZ_PATH = os.environ.get("PSES_RESULTS_GZ", "/tmp/Results2024.csv.gz")
 
-# Parquet dataset location (directory). Prefer a persistent folder.
-PARQUET_ROOTDIR = os.environ.get("PSES_PARQUET_DIR", "data/parquet/PSES_Results2024_v2")
+# Parquet dataset location (directory).
+# Streamlit Cloud is most reliable when writing to /tmp (writable). Repo paths can be fragile.
+PARQUET_ROOTDIR = os.environ.get("PSES_PARQUET_DIR", "/tmp/pses_parquet/PSES_Results2024_v2")
 PARQUET_FLAG = os.path.join(PARQUET_ROOTDIR, "_BUILD_OK_v2")
 
 # Output schema (normalized)
@@ -97,31 +98,21 @@ def ensure_results2024_local(file_id: Optional[str] = None) -> str:
       2) Streamlit secret RESULTS2024_FILE_ID (if present)
       3) GDRIVE_FILE_ID_FALLBACK (non-empty by default to prevent boot failures)
     """
-    # Defensive import: make missing dependency obvious
     try:
         import gdown  # type: ignore
     except Exception as e:
-        raise RuntimeError(
-            "Missing dependency: `gdown`. It must be present in requirements.txt."
-        ) from e
+        raise RuntimeError("Missing dependency: `gdown`. It must be present in requirements.txt.") from e
 
-    # Prefer explicit arg, then Secrets, then fallback
-    fid = (
-        file_id
-        or st.secrets.get("RESULTS2024_FILE_ID")
-        or GDRIVE_FILE_ID_FALLBACK
-    )
-
+    fid = file_id or st.secrets.get("RESULTS2024_FILE_ID") or GDRIVE_FILE_ID_FALLBACK
     if not fid:
         raise RuntimeError(
-            "RESULTS2024_FILE_ID is missing. "
-            "Set Streamlit Secrets RESULTS2024_FILE_ID or set GDRIVE_FILE_ID_FALLBACK."
+            "RESULTS2024_FILE_ID is missing. Set Streamlit Secrets RESULTS2024_FILE_ID "
+            "or set GDRIVE_FILE_ID_FALLBACK in utils/data_loader.py."
         )
 
     if os.path.exists(LOCAL_GZ_PATH) and os.path.getsize(LOCAL_GZ_PATH) > 0:
         return LOCAL_GZ_PATH
 
-    # Ensure parent dir exists (handle '/tmp/...' and also edge cases like 'Results2024.csv.gz')
     parent = os.path.dirname(LOCAL_GZ_PATH)
     if parent:
         os.makedirs(parent, exist_ok=True)
@@ -145,24 +136,16 @@ def _detect_agree_header(csv_path: str) -> Optional[str]:
         cols = pd.read_csv(csv_path, compression="gzip", nrows=0).columns.tolist()
     except Exception:
         return None
-    # Build a case-insensitive lookup
     lower_map = {c.lower(): c for c in cols}
 
-    # Preferred matches (first wins)
-    candidates = [
-        "agree", "agree_pct", "agree pct", "agreepercent", "pct_agree"
-    ]
+    candidates = ["agree", "agree_pct", "agree pct", "agreepercent", "pct_agree"]
     for key in candidates:
         if key in lower_map:
             return lower_map[key]
     return None
 
 def _with_agree_in_usecols(base: Sequence[str], csv_path: str) -> list[str]:
-    """
-    Return a copy of base usecols with the detected Agree header added if present.
-    """
     agree_col = _detect_agree_header(csv_path)
-    # update module-level diagnostic source
     global _AGREE_SRC
     _AGREE_SRC = agree_col
     s = {c for c in base}
@@ -171,7 +154,6 @@ def _with_agree_in_usecols(base: Sequence[str], csv_path: str) -> list[str]:
     return list(s)
 
 def _csv_has_level1id(csv_path: str) -> bool:
-    """Peek header to see if LEVEL1ID exists (robust for DuckDB path)."""
     try:
         cols = pd.read_csv(csv_path, compression="gzip", nrows=0).columns
         return "LEVEL1ID" in cols
@@ -182,34 +164,20 @@ def _csv_has_level1id(csv_path: str) -> bool:
 # Canonicalization helpers
 # =============================================================================
 def _canon_demcode_series(s: pd.Series) -> pd.Series:
-    """
-    Canonicalize DEMCODE/group_value as a string:
-      - trim whitespace
-      - remove trailing .0 / .000 (e.g., 8474.0 -> 8474)
-      - remove trailing zeros from fractional part (8474.50 -> 8474.5)
-      - remove trailing dot (123. -> 123)
-      - blanks/NaN -> "All"
-    """
     s = s.astype("string")
     s = s.str.strip()
-    # drop .0... entirely
     s = s.str.replace(r"\.0+$", "", regex=True)
-    # drop trailing zeros in fractional part but keep at least one significant (e.g., .50 -> .5)
     s = s.str.replace(r"(\.\d*?[1-9])0+$", r"\1", regex=True)
-    # drop dangling dot
     s = s.str.replace(r"\.$", "", regex=True)
-    # normalize blanks to "All"
     s = s.mask(s.isna() | (s == ""), "All")
     return s
 
 def _canon_demcode_value(v: Optional[str]) -> Optional[str]:
-    """Canonicalize a single DEMCODE value (used on the filter target)."""
     if v is None:
         return None
     s = str(v).strip()
     if s == "" or s.lower() == "all":
-        return None  # None means overall in our filter API
-    # same transforms as the series helper
+        return None
     import re
     s = re.sub(r"\.0+$", "", s)
     s = re.sub(r"(\.\d*?[1-9])0+$", r"\1", s)
@@ -220,30 +188,19 @@ def _canon_demcode_value(v: Optional[str]) -> Optional[str]:
 # Type normalization
 # =============================================================================
 def _normalize_df_types(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Final, canonical normalization applied to all code paths:
-      - year           → Int16
-      - question_code  → string, TRIM, UPPER
-      - group_value    → canonicalized string (8474.0 -> 8474), blanks/NaN → "All"
-      - metrics        → typed
-    """
     if df is None or df.empty:
         return df if isinstance(df, pd.DataFrame) else pd.DataFrame(columns=OUT_COLS)
 
     df = df.reindex(columns=OUT_COLS)
 
-    # year/numeric columns
     df["year"] = pd.to_numeric(df["year"], errors="coerce").astype(DTYPES["year"])
     df["n"]    = pd.to_numeric(df["n"], errors="coerce").astype(DTYPES["n"])
     for c in ["positive_pct","neutral_pct","negative_pct","agree_pct",
               "answer1","answer2","answer3","answer4","answer5","answer6","answer7"]:
         df[c] = pd.to_numeric(df[c], errors="coerce").astype(DTYPES[c])
 
-    # question_code: UPPER(TRIM)
     q = df["question_code"].astype("string")
     df["question_code"] = q.str.strip().str.upper().astype(DTYPES["question_code"])
-
-    # group_value: canonicalize (handles 8474.0 -> 8474 and blanks -> "All")
     df["group_value"] = _canon_demcode_series(df["group_value"]).astype(DTYPES["group_value"])
 
     return df
@@ -259,19 +216,15 @@ def _build_parquet_with_duckdb(csv_path: str) -> None:
     has_lvl1 = _csv_has_level1id(csv_path)
     where_clause = "WHERE CAST(LEVEL1ID AS INT) = 0" if has_lvl1 else ""
 
-    # Detect agree header once
     agree_col = _detect_agree_header(csv_path)
-    # Update diagnostic
     global _AGREE_SRC
     _AGREE_SRC = agree_col
 
-    # Agree projection: either cast detected column or NULL if absent
     if agree_col:
         agree_select = f'CAST("{agree_col}" AS DOUBLE)                                     AS agree_pct,'
     else:
         agree_select = 'CAST(NULL AS DOUBLE)                                               AS agree_pct,'
 
-    # Note: DEMCODE canonicalization is applied via regex_replace in SQL.
     con.execute(f"""
         CREATE OR REPLACE TABLE pses AS
         SELECT
@@ -313,7 +266,6 @@ def _build_parquet_with_pandas(csv_path: str) -> None:
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    # Detect agree header and build usecols dynamically so we don't drop it
     agree_col = _detect_agree_header(csv_path)
     global _AGREE_SRC
     _AGREE_SRC = agree_col
@@ -323,7 +275,6 @@ def _build_parquet_with_pandas(csv_path: str) -> None:
 
     df = pd.read_csv(csv_path, compression="gzip", usecols=usecols, low_memory=False)
 
-    # Bring LEVEL1ID if present (separate small pass)
     try:
         cols = pd.read_csv(csv_path, compression="gzip", nrows=0).columns
         if "LEVEL1ID" in cols:
@@ -332,11 +283,9 @@ def _build_parquet_with_pandas(csv_path: str) -> None:
     except Exception:
         pass
 
-    # Filter to PS-wide if LEVEL1ID present
     if "LEVEL1ID" in df.columns:
         df = df[pd.to_numeric(df["LEVEL1ID"], errors="coerce").fillna(0).astype(int).eq(0)]
 
-    # Normalize to OUT_COLS (apply TRIM/UPPER + DEMCODE canonicalization)
     out = pd.DataFrame({
         "year":          pd.to_numeric(df["SURVEYR"], errors="coerce").astype("Int64"),
         "question_code": df["QUESTION"].astype("string").str.strip().str.upper(),
@@ -374,26 +323,19 @@ def _parquet_rowcount(root: str) -> int:
 
 @st.cache_resource(show_spinner="🗂️ Preparing Parquet dataset (one-time)…")
 def ensure_parquet_dataset() -> str:
-    """
-    Ensures a partitioned Parquet dataset (PS-wide if LEVEL1ID present) exists and is non-empty.
-    If an existing dataset is empty, it gets rebuilt automatically.
-    """
     if not _pyarrow_available():
         raise RuntimeError("pyarrow is required for Parquet fast path.")
     csv_path = ensure_results2024_local()
 
-    # Touch detection early for diagnostics
     try:
         global _AGREE_SRC
         _AGREE_SRC = _detect_agree_header(csv_path)
     except Exception:
         pass
 
-    # If dataset looks ready, validate it's not empty
     if os.path.isdir(PARQUET_ROOTDIR) and os.path.exists(PARQUET_FLAG):
         if _parquet_rowcount(PARQUET_ROOTDIR) > 0:
             return PARQUET_ROOTDIR
-        # Rebuild if empty
         try:
             shutil.rmtree(PARQUET_ROOTDIR, ignore_errors=True)
         except Exception:
@@ -406,7 +348,6 @@ def ensure_parquet_dataset() -> str:
     else:
         _build_parquet_with_pandas(csv_path)
 
-    # Validate row count; if still zero, raise so caller can fall back
     rc = _parquet_rowcount(PARQUET_ROOTDIR)
     if rc <= 0:
         raise RuntimeError("Parquet dataset built but contains 0 rows.")
@@ -426,11 +367,6 @@ def _path_candidate(*names: str) -> str | None:
 
 @st.cache_resource(show_spinner=False)
 def load_questions_metadata() -> pd.DataFrame:
-    """
-    Reads metadata/Survey Questions.xlsx
-    - 'question' column contains the question number/code (e.g., Q16)
-    - 'English' column contains the question text
-    """
     path = _path_candidate("metadata/Survey Questions.xlsx", "/mnt/data/Survey Questions.xlsx")
     if not path:
         return pd.DataFrame(columns=["code", "text", "display"])
@@ -485,11 +421,6 @@ def load_demographics_metadata() -> pd.DataFrame:
 # =============================================================================
 @st.cache_resource(show_spinner="🧠 Loading PS-wide data into memory…")
 def preload_pswide_dataframe() -> pd.DataFrame:
-    """
-    Loads the PS-wide (LEVEL1ID==0) slice into memory with normalized OUT_COLS.
-    Prefer Parquet (already filtered at build); fall back to CSV streaming if empty.
-    """
-    # Prefer Parquet; ensure valid & non-empty
     try:
         root = ensure_parquet_dataset()
         if _pyarrow_available():
@@ -498,13 +429,10 @@ def preload_pswide_dataframe() -> pd.DataFrame:
             table = dataset.to_table(columns=OUT_COLS)
             df = table.to_pandas(types_mapper=pd.ArrowDtype)
             if df is not None and not df.empty:
-                # final canonical normalization (idempotent)
                 return _normalize_df_types(df)
     except Exception:
-        # Fall through to CSV preload
         pass
 
-    # CSV streaming preload (PS-wide filter if LEVEL1ID present)
     try:
         path = ensure_results2024_local()
         base_usecols = _with_agree_in_usecols(CSV_USECOLS, path)
@@ -514,7 +442,7 @@ def preload_pswide_dataframe() -> pd.DataFrame:
                 mask_lvl = pd.to_numeric(chunk["LEVEL1ID"], errors="coerce").fillna(0).astype(int).eq(0)
                 chunk = chunk.loc[mask_lvl, :]
             sel = chunk
-            agree_col = _AGREE_SRC  # populated by _with_agree_in_usecols
+            agree_col = _AGREE_SRC
             out = pd.DataFrame({
                 "year":          pd.to_numeric(sel["SURVEYR"], errors="coerce"),
                 "question_code": sel["QUESTION"].astype("string").str.strip().str.upper(),
@@ -552,10 +480,9 @@ def _parquet_query(question_code: str, years: Iterable[int | str], group_value: 
     root = ensure_parquet_dataset()
     dataset = ds.dataset(root, format="parquet")
 
-    # Compare using normalized value (UPPER/TRIM applied at build)
     q = str(question_code).strip().upper()
     years_int = [int(y) for y in years]
-    gv_norm = _canon_demcode_value(group_value)  # canonicalize target
+    gv_norm = _canon_demcode_value(group_value)
 
     filt = (pc.field("question_code") == q) & (pc.field("year").isin(years_int))
     if gv_norm is None:
@@ -579,7 +506,7 @@ def _csv_stream_filter(
     path = ensure_results2024_local()
     years_int = [int(y) for y in years]
     q_norm = str(question_code).strip().upper()
-    gv_target = _canon_demcode_value(group_value)  # canonical form or None (overall)
+    gv_target = _canon_demcode_value(group_value)
 
     frames: list[pd.DataFrame] = []
     usecols = _with_agree_in_usecols(CSV_USECOLS, path)
@@ -589,15 +516,11 @@ def _csv_stream_filter(
         else:
             mask_lvl = pd.Series(True, index=chunk.index)
 
-        # Normalize QUESTION/YEAR for equality
         q_ser = chunk["QUESTION"].astype(str).str.strip().str.upper()
         y_ser = pd.to_numeric(chunk["SURVEYR"], errors="coerce")
-
         mask = (q_ser == q_norm) & (y_ser.isin(years_int)) & mask_lvl
 
-        # Canonicalize DEMCODE column before comparing
         gv_ser = _canon_demcode_series(chunk["DEMCODE"])
-
         if gv_target is None:
             mask &= (gv_ser == "All")
         else:
@@ -637,24 +560,17 @@ def load_results2024_filtered(
     years: Iterable[int | str],
     group_value: Optional[str] = None,
 ) -> pd.DataFrame:
-    """
-    Returns a filtered slice at (question_code, years, group_value) grain.
-    Prefers in-memory PS-wide preload (LEVEL1ID==0), then Parquet pushdown, then CSV streaming.
-    Records detailed diagnostics for the UI.
-    """
     global _LAST_ENGINE
     parquet_error = None
     t0 = time.perf_counter()
 
-    # Try in-memory PS-wide DataFrame first (fast & no I/O)
     try:
         df_all = preload_pswide_dataframe()
         if isinstance(df_all, pd.DataFrame) and not df_all.empty:
             q = str(question_code).strip().upper()
             years_int = [int(y) for y in years]
-            gv_norm = _canon_demcode_value(group_value)  # None for overall
+            gv_norm = _canon_demcode_value(group_value)
 
-            # Build masks using normalized comparisons (df_all already normalized)
             mask = (df_all["question_code"] == q) & (df_all["year"].astype(int).isin(years_int))
             if gv_norm is None:
                 mask &= (df_all["group_value"] == "All")
@@ -681,7 +597,6 @@ def load_results2024_filtered(
     except Exception:
         pass
 
-    # Try Parquet pushdown next
     if _pyarrow_available():
         try:
             df = _parquet_query(question_code, years, group_value)
@@ -704,7 +619,6 @@ def load_results2024_filtered(
         except Exception as e:
             parquet_error = str(e)
 
-    # CSV fallback
     df = _csv_stream_filter(question_code, years, group_value)
     _LAST_ENGINE = "csv"
     rows = int(df.shape[0])
@@ -754,16 +668,22 @@ def prewarm_all() -> dict:
     """
     Build/ensure backend (Parquet or CSV), load metadata into cache,
     load the PS-wide DataFrame into memory, and return a summary for UI.
+
+    IMPORTANT: This function must not crash the whole app during Streamlit startup.
     """
     # Ensure raw results are present
     ensure_results2024_local()
 
-    # Prefer Parquet if available (and build if needed)
     engine = "csv"
+    parquet_err = None
+    inmem_err = None
+
+    # Prefer Parquet if available (and build if needed)
     try:
         ensure_parquet_dataset()
         engine = "parquet"
-    except Exception:
+    except Exception as e:
+        parquet_err = str(e)
         engine = "csv"
 
     # Metadata (cached)
@@ -779,14 +699,19 @@ def prewarm_all() -> dict:
         "demographics": int(ddf.shape[0]) if ddf is not None else 0,
     }
 
-    # In-memory PS-wide DataFrame (cached)
-    df_inmem = preload_pswide_dataframe()
+    # In-memory PS-wide DataFrame (cached) — do not crash app if this fails
+    df_inmem = pd.DataFrame(columns=OUT_COLS)
+    try:
+        df_inmem = preload_pswide_dataframe()
+    except Exception as e:
+        inmem_err = str(e)
+        df_inmem = pd.DataFrame(columns=OUT_COLS)
+
     _INMEM_STATE.update({
-        "mode": f"pswide_df({engine})",
+        "mode": f"pswide_df({engine})" if inmem_err is None else "pswide_df(failed)",
         "rows": int(df_inmem.shape[0]) if isinstance(df_inmem, pd.DataFrame) else 0
     })
 
-    # Lift last-engine for UI
     global _LAST_ENGINE
     _LAST_ENGINE = engine
 
@@ -799,16 +724,16 @@ def prewarm_all() -> dict:
         "parquet_dir": PARQUET_ROOTDIR,
         "csv_path": LOCAL_GZ_PATH,
         "agree_src": _AGREE_SRC,
+        "parquet_error": parquet_err,
+        "inmem_error": inmem_err,
     }
 
-# Back-compat API used by older main.py versions
 @st.cache_resource(show_spinner="⚡ Warming up data backend…")
 def prewarm_fastpath() -> str:
     summary = prewarm_all()
     return "parquet" if summary.get("engine") == "parquet" else "csv"
 
 def get_backend_info() -> dict:
-    # If prewarm_all() hasn't been called yet in this session, call it now (no-op if cached)
     try:
         summary = prewarm_all()
     except Exception:
