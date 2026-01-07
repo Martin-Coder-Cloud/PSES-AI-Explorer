@@ -5,5 +5,8 @@ gdown==5.1.0
 XlsxWriter
 sentence-transformers==2.7.0
 numpy>=1.24.0
+openai>=1.0.0
+
+
 
 
