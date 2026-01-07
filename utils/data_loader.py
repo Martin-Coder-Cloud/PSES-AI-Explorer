@@ -14,7 +14,8 @@ import streamlit as st
 # =============================================================================
 
 # Google Drive CSV (set real ID in Streamlit secrets as RESULTS2024_FILE_ID)
-GDRIVE_FILE_ID_FALLBACK = ""  # optional placeholder; prefer st.secrets["RESULTS2024_FILE_ID"]
+# NOTE: Fallback is set so the app does not hard-fail if Streamlit Secrets are missing.
+GDRIVE_FILE_ID_FALLBACK = "1VdMQQfEP-BNXle8GeD-Z_upt2pPIGvc8"
 LOCAL_GZ_PATH = os.environ.get("PSES_RESULTS_GZ", "/tmp/Results2024.csv.gz")
 
 # Parquet dataset location (directory). Prefer a persistent folder.
@@ -88,17 +89,46 @@ def _pyarrow_available() -> bool:
 # =============================================================================
 @st.cache_resource(show_spinner="📥 Downloading Results2024.csv.gz…")
 def ensure_results2024_local(file_id: Optional[str] = None) -> str:
-    import gdown
-    fid = file_id or st.secrets.get("RESULTS2024_FILE_ID", GDRIVE_FILE_ID_FALLBACK)
+    """
+    Ensure the gzipped CSV exists locally at LOCAL_GZ_PATH and return its path.
+
+    Resolution order for Google Drive file id:
+      1) function argument file_id
+      2) Streamlit secret RESULTS2024_FILE_ID (if present)
+      3) GDRIVE_FILE_ID_FALLBACK (non-empty by default to prevent boot failures)
+    """
+    # Defensive import: make missing dependency obvious
+    try:
+        import gdown  # type: ignore
+    except Exception as e:
+        raise RuntimeError(
+            "Missing dependency: `gdown`. It must be present in requirements.txt."
+        ) from e
+
+    # Prefer explicit arg, then Secrets, then fallback
+    fid = (
+        file_id
+        or st.secrets.get("RESULTS2024_FILE_ID")
+        or GDRIVE_FILE_ID_FALLBACK
+    )
+
     if not fid:
-        raise RuntimeError("RESULTS2024_FILE_ID missing in .streamlit/secrets.toml")
+        raise RuntimeError(
+            "RESULTS2024_FILE_ID is missing. "
+            "Set Streamlit Secrets RESULTS2024_FILE_ID or set GDRIVE_FILE_ID_FALLBACK."
+        )
 
     if os.path.exists(LOCAL_GZ_PATH) and os.path.getsize(LOCAL_GZ_PATH) > 0:
         return LOCAL_GZ_PATH
 
-    os.makedirs(os.path.dirname(LOCAL_GZ_PATH), exist_ok=True)
+    # Ensure parent dir exists (handle '/tmp/...' and also edge cases like 'Results2024.csv.gz')
+    parent = os.path.dirname(LOCAL_GZ_PATH)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
     url = f"https://drive.google.com/uc?id={fid}"
     gdown.download(url, LOCAL_GZ_PATH, quiet=False)
+
     if not os.path.exists(LOCAL_GZ_PATH) or os.path.getsize(LOCAL_GZ_PATH) == 0:
         raise RuntimeError("Download failed or produced an empty file.")
     return LOCAL_GZ_PATH
@@ -548,7 +578,6 @@ def _csv_stream_filter(
 ) -> pd.DataFrame:
     path = ensure_results2024_local()
     years_int = [int(y) for y in years]
-    q_norm = str(question_code).strip().str.upper() if hasattr(str(question_code), "strip") else str(question_code).upper()
     q_norm = str(question_code).strip().upper()
     gv_target = _canon_demcode_value(group_value)  # canonical form or None (overall)
 
